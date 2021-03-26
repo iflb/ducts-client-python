@@ -4,8 +4,8 @@ import msgpack
 from datetime import datetime
 import uuid as uuid_pkg
 
-from events import DuctConnectionEvent
-from event_listeners import ConnectionEventListener
+from .events import DuctConnectionEvent
+from .event_listeners import ConnectionEventListener
 
 class Duct:
     def __init__(self):

@@ -1,5 +1,5 @@
 import asyncio
-from ducts import Duct
+from ducts_client import Duct
 
 class MyPlayground:
     def __init__(self):
