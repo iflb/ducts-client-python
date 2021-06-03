@@ -4,6 +4,7 @@ import async_timeout
 import msgpack
 from datetime import datetime
 import uuid as uuid_pkg
+import traceback
 
 from .events import DuctConnectionEvent, DuctMessageEvent
 from .event_listeners import ConnectionEventListener
@@ -15,11 +16,16 @@ class CallTimeout(DuctException):
     def __init__(self, future):
         super().__init__()
         self.future = future
+
+class Dummy:
     
+    def __getitem__(self, key):
+        raise ValueError('Duct not opened.')
+   
 class Duct:
     def __init__(self):
         self.WSD = None
-        self.EVENT = None
+        self.EVENT = Dummy()
         self._ws = None
         self._last_rid = 0
         self._loop_future = None
@@ -157,7 +163,6 @@ class Duct:
         eid = self.EVENT["ALIVE_MONITORING"]
         value = self._send_timestamp
         await self.send(rid, eid, value)
-
         await self.onopen(event)
 
     async def _onclose(self):
@@ -191,11 +196,15 @@ class Duct:
                             if eid > 0:
                                 future.set_result(data)
                             else:
-                                future.set_exception(Exception(data))
+                                try:
+                                    future.set_exception(eval(data))
+                                except Exception as e:
+                                    traceback.print_stack()
+                                    future.set_exception(Exception(data))
+
                     except Exception as e:
                         await self.event_error_handler(rid, eid, data, e)
             except Exception as e:
-                print(e)
                 await self.event_error_handler(-1, -1, None, e)
 
     async def _alive_monitoring_handler(self, rid, eid, data):
