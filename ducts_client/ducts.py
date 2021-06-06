@@ -5,9 +5,14 @@ import msgpack
 from datetime import datetime
 import uuid as uuid_pkg
 import traceback
+from functools import partial
+from io import BytesIO
 
 from .events import DuctConnectionEvent, DuctMessageEvent
 from .event_listeners import ConnectionEventListener
+
+import logging
+logger = logging.getLogger(__name__)
 
 class DuctException(Exception):
     pass
@@ -31,6 +36,8 @@ class Duct:
         self._loop_future = None
         self._open_wait_lock = asyncio.Condition()
         self._futures = {}
+        self._loop_queues = {}
+        self._divided_buffers = {}
 
         self.connection_listener = ConnectionEventListener()
         self._event_handler = {}
@@ -159,6 +166,11 @@ class Duct:
         self.time_latency = 0
         self._time_count = 0
         self.set_event_handler(self.EVENT["ALIVE_MONITORING"], self._alive_monitoring_handler)
+        self.set_event_handler(self.EVENT["LOOP_RESPONSE_START"], self._loop_response_handler)
+        self.set_event_handler(self.EVENT["LOOP_RESPONSE_NEXT"], self._loop_response_handler)
+        self.set_event_handler(self.EVENT["LOOP_RESPONSE_END"], self._loop_response_end_handler)
+        self.set_event_handler(self.EVENT["DIVIDED_RESPONSE_APPEND"], self._divided_response_append_handler)
+        self.set_event_handler(self.EVENT["DIVIDED_RESPONSE_END"], self._divided_response_end_handler)
         rid = self.next_rid()
         eid = self.EVENT["ALIVE_MONITORING"]
         value = self._send_timestamp
@@ -186,26 +198,34 @@ class Duct:
 
                 elif msg.type==aiohttp.WSMsgType.BINARY:
                     rid, eid, data = msgpack.unpackb(msg.data)
+                    #print(f'####################{rid}-{eid}')
+                    #print(f'####################{rid}-{eid}-{data}')
                     await self.connection_listener.onmessage(DuctMessageEvent(rid,eid,data))
                     try:
                         await self.catchall_event_handler(rid, eid, data)
-                        handle = self._event_handler[eid] if eid in self._event_handler else self.uncaught_event_handler
-                        await handle(rid, eid, data)
-                        future = self._futures.pop(rid, None)
-                        if future:
-                            if eid > 0:
-                                future.set_result(data)
-                            else:
-                                try:
-                                    future.set_exception(eval(data))
-                                except Exception as e:
-                                    traceback.print_stack()
-                                    future.set_exception(Exception(data))
-
+                        handle = self._event_handler[abs(eid)] if eid in self._event_handler else self.uncaught_event_handler
+                        ret = await handle(rid, eid, data)
+                        if ret:
+                            await self._handle_request_future(*ret)
+                        else:
+                            await self._handle_request_future(rid, eid, data)
                     except Exception as e:
                         await self.event_error_handler(rid, eid, data, e)
             except Exception as e:
                 await self.event_error_handler(-1, -1, None, e)
+
+    async def _handle_request_future(self, rid, eid, data):
+        future = self._futures.pop(rid, None)
+        if future:
+            if eid > 0:
+                future.set_result(data)
+            else:
+                try:
+                    future.set_exception(eval(data))
+                except Exception as e:
+                    traceback.print_stack()
+                    future.set_exception(Exception(data))
+        
 
     async def _alive_monitoring_handler(self, rid, eid, data):
         client_received = datetime.now().timestamp()
@@ -217,3 +237,70 @@ class Duct:
         self.time_offset = (self.time_offset * self._time_count + new_offset) / (self._time_count + 1)
         self.time_latency = (self.time_latency * self._time_count + new_latency) / (self._time_count + 1)
         self._time_count += 1
+
+    async def _loop_response_handler(self, rid, eid, data):
+        #print(f'1!!!!!!!!!!!!!!!!!!!!![{rid}]-[{eid}]-[{data}]')
+        source_eid = data[1]
+        source_data = data[2]
+        await self.catchall_event_handler(rid, source_eid, source_data)
+        handle = self._event_handler[abs(source_eid)] if source_eid in self._event_handler else self.uncaught_event_handler
+        await handle(rid, source_eid, source_data)
+
+        queue = self._loop_queues.get(rid, None)
+        if queue is None:
+            queue = asyncio.Queue()
+            self._loop_queues[rid] = queue
+
+        #print(f'2!!!!!!!!!!!!!!!!!!!!!!!![{source_eid}]-[{source_data}]')
+        if source_data is not None:
+            await queue.put(source_data)
+        return rid, source_eid, queue
+    
+    async def _loop_response_end_handler(self, rid, eid, data):
+        #print(f'3!!!!!!!!!!!!!!!!!!!!![{rid}]-[{eid}]-[{data}]')
+        source_eid = data[1]
+        source_data = data[2]
+        await self.catchall_event_handler(rid, source_eid, source_data)
+        handle = self._event_handler[abs(source_eid)] if source_eid in self._event_handler else self.uncaught_event_handler
+        await handle(rid, source_eid, source_data)
+            
+        queue = self._loop_queues.pop(rid, None)
+        #print(f'4!!!!!!!!!!!!!!!!!!!!!!!![{source_eid}]-[{source_data}]-[{queue}]')
+        if queue is not None:
+            await queue.put(None)
+        if source_data:
+            logger.warn('LOOP|RESPONSE_END_HANDLER|DATA_IGNORED|DATA=%s', source_data)
+
+        return rid, source_eid, source_eid
+    
+    async def _divided_response_append_handler(self, rid, eid, data):
+        #print(f'1!!!!!!!!!!!!!!!!!!!!![{rid}]-[{eid}]-[{len(data)}]')
+        bio = self._divided_buffers.get(rid, None)
+        if bio is None:
+            bio = BytesIO()
+            self._divided_buffers[rid] = bio
+        #print(f'1.5!!!!!!!!!!!!!!!!!!!!![{rid}]-[{eid}]-[{len(bio.getvalue())}]')
+        if data:
+            bio.write(data)
+        #print(f'2!!!!!!!!!!!!!!!!!!!!![{rid}]-[{eid}]-[{len(bio.getvalue())}]')
+        return -1, eid, None
+
+    
+    async def _divided_response_end_handler(self, rid, eid, data):
+        #print(f'3!!!!!!!!!!!!!!!!!!!!![{rid}]-[{eid}]')
+        bio = self._divided_buffers.pop(rid, None)
+        if bio is not None:
+            if data is not None:
+                bio.write(data)
+            data = bio.getvalue()
+
+        if data is None:
+            logger.warn('DIVIDED|RESPONSE_END_HANDLER|DATA_IGNORED|DATA=%s', data)
+            
+        rid, source_eid, source_data = msgpack.unpackb(data)
+        #print(f'4!#################################![{rid}]-[{source_eid}]-[{len(source_data)}]')
+        await self.catchall_event_handler(rid, source_eid, source_data)
+        handle = self._event_handler[abs(source_eid)] if source_eid in self._event_handler else self.uncaught_event_handler
+        await handle(rid, source_eid, source_data)
+        return rid, source_eid, source_data
+        
